@@ -1,0 +1,91 @@
+name: Build web preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Source repo, owner/name"
+        required: true
+      branch:
+        description: "Branch to build"
+        required: true
+        default: main
+      slug:
+        description: "Folder name for the app (lowercase letters and numbers)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages-push
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the previews repo
+        uses: actions/checkout@v4
+        with:
+          path: previews
+
+      - name: Check out the app source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.branch }}
+          path: src
+          # Private repos need the PREVIEWS_TOKEN secret; public repos build without it.
+          token: ${{ secrets.PREVIEWS_TOKEN || github.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        working-directory: src
+        run: |
+          if [ -f package-lock.json ]; then npm ci --legacy-peer-deps || npm install --legacy-peer-deps; else npm install --legacy-peer-deps; fi
+          npx expo install react-native-web react-dom @expo/metro-runtime -- --legacy-peer-deps
+
+      - name: Point the web build at its sub-folder
+        working-directory: src
+        env:
+          SLUG: ${{ inputs.slug }}
+        run: |
+          node -e '
+            const fs=require("fs");
+            if(!fs.existsSync("app.json")){console.log("no app.json, leaving config alone");process.exit(0);}
+            const j=JSON.parse(fs.readFileSync("app.json","utf8"));
+            j.expo=j.expo||{};
+            j.expo.web={...(j.expo.web||{}),bundler:"metro",output:"single"};
+            j.expo.experiments={...(j.expo.experiments||{}),baseUrl:"/app-previews/"+process.env.SLUG};
+            fs.writeFileSync("app.json",JSON.stringify(j,null,2));
+          '
+
+      - name: Export for web
+        working-directory: src
+        env:
+          CI: "1"
+          EXPO_NO_TELEMETRY: "1"
+        run: npx expo export --platform web --output-dir dist
+
+      - name: Publish to the previews repo
+        env:
+          SLUG: ${{ inputs.slug }}
+          SRC_REPO: ${{ inputs.repo }}
+        run: |
+          rm -rf "previews/$SLUG"
+          mkdir -p "previews/$SLUG"
+          cp -R src/dist/. "previews/$SLUG/"
+          cd previews
+          touch .nojekyll
+          git config user.name "app-previews bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "Web preview: $SLUG (from $SRC_REPO)" || { echo "nothing changed"; exit 0; }
+          git pull --rebase origin main
+          git push origin HEAD:main
+          echo "Live at https://samayhuf-star.github.io/app-previews/$SLUG/" >> "$GITHUB_STEP_SUMMARY"
